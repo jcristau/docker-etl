@@ -67,6 +67,7 @@ class MetricExportCommand(ConfigCommand):
 
 def run():
     application = Application()
+    application.catch_exceptions(False)
     application.add(PulseDrainCommand())
     application.add(MetricExportCommand())
     application.run()

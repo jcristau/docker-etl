@@ -12,10 +12,11 @@ from google.cloud import storage
 from google.cloud.exceptions import NotFound
 from kombu import Message
 from loguru import logger
+import taskcluster
 
 from fxci_etl.config import Config
 from fxci_etl.loaders.bigquery import BigQueryLoader
-from fxci_etl.schemas import Record, Runs, Tasks, Tags
+from fxci_etl.schemas import Record, Runs, Tasks, Tags, TaskDefinition
 
 
 @dataclass
@@ -48,6 +49,7 @@ class PulseHandler(ABC):
         self._event_backup = bucket.blob(f"failed-pulse-events-{self.name}.json")
         self._buffer: list[Event] = []
         self._count = 0
+        self._queue = taskcluster.Queue({"rootUrl": config.taskcluster.rootUrl})
 
     def __call__(self, data: dict[str, Any], message: Message) -> None:
         self._count += 1
@@ -91,6 +93,7 @@ class BigQueryHandler(PulseHandler):
     def __init__(self, config: Config, **kwargs: Any):
         super().__init__(config, **kwargs)
         self.task_records: list[Record] = []
+        self.task_ids: set[Record] = set()
         self.run_records: list[Record] = []
 
         self._convert_camel_case_re = re.compile(r"(?<!^)(?=[A-Z])")
@@ -112,12 +115,14 @@ class BigQueryHandler(PulseHandler):
     def process_event(self, event):
         data = event.data
 
+        status = data["status"]
+        self.task_ids.add(status["taskId"])
+
         if data.get("runId") is None:
-            # This can happen if `deadline` was exceeded before a run could
-            # start. Ignore this case.
+            # This can happen if the task was just created or if `deadline` was
+            # exceeded before a run could start. Ignore this case.
             return
 
-        status = data["status"]
         run = data["status"]["runs"][data["runId"]]
         run_record = {
             "task_id": status["taskId"],
@@ -176,3 +181,16 @@ class BigQueryHandler(PulseHandler):
             run_loader = BigQueryLoader(self.config, "runs")
             run_loader.insert(self.run_records)
             self.run_records = []
+
+        if self.task_ids:
+            taskdef_loader = BigQueryLoader(self.config, "taskdefinition")
+            taskdefs = []
+            def paginationHandler(response):
+                taskdefs.extend(response["tasks"])
+            resp = self._queue.tasks(payload={"taskIds": list(self.task_ids)}, paginationHandler=paginationHandler)
+            for task in taskdefs:
+                taskdef = task["task"]
+                taskdef["taskId"] = task["taskId"]
+            taskdef_records = [TaskDefinition.from_dict(task["task"]) for task in taskdefs["tasks"]]
+            taskdef_loader.insert(taskdef_records)
+            self.task_ids.clear()
